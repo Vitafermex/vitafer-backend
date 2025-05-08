@@ -28,8 +28,12 @@ const clientMongo = new MongoClient(mongoUri);
 async function connectDB() {
   try {
     await clientMongo.connect();
-    db = clientMongo.db();
-    console.log("Conectado a MongoDB Atlas");
+    const dbName = new URL(mongoUri).pathname.substring(1);
+    db = clientMongo.db(dbName || undefined); 
+    if (!db.databaseName) {
+        console.warn("Advertencia: No se pudo determinar el nombre de la base de datos desde MONGO_URI. Asegúrate de incluirlo en la URI o especificarlo en clientMongo.db('tu_db').");
+    }
+    console.log(`Conectado a MongoDB Atlas - DB: ${db.databaseName}`);
   } catch (error) {
     console.error("Error conectando a MongoDB:", error);
     process.exit(1);
@@ -50,20 +54,39 @@ app.post('/api/create-preference', async (req, res) => {
       return res.status(400).json({ message: 'Datos de la orden inválidos o incompletos' });
   }
 
+  const ordersCollection = db.collection('orders');
 
   try {
-    const ordersCollection = db.collection('orders');
     const newOrder = {
         customerDetails: orderData.customerDetails,
-        items: orderData.items,
+        items: orderData.items.map(item => ({
+            name: item.name,
+            presentation: item.presentation,
+            quantity: item.quantity,
+            unitPrice: item.unit_price,
+            totalItemPrice: item.quantity * item.unit_price
+        })),
         totalAmount: orderData.totalAmount,
         status: 'pending_preference',
+        paymentDetails: {
+            method: 'mercadopago',
+            mercadoPagoPreferenceId: null,
+            mercadoPagoPaymentId: null,
+            paymentStatus: 'pending',
+            paidAt: null
+        },
+        shippingDetails: {
+            method: "Por definir",
+            cost: 0,
+            trackingNumber: null
+        },
         createdAt: new Date(),
+        updatedAt: new Date()
     };
     const savedOrder = await ordersCollection.insertOne(newOrder);
     const orderId = savedOrder.insertedId;
 
-    console.log(`Orden ${orderId} pre-guardada en MongoDB.`);
+    console.log(`Orden ${orderId} creada en MongoDB.`);
 
     const preferenceData = {
        body: {
@@ -78,14 +101,12 @@ app.post('/api/create-preference', async (req, res) => {
          payer: {
              name: orderData.customerDetails.name,
              email: orderData.customerDetails.email,
-             phone: {
-                number: orderData.customerDetails.phone,
-             },
+             phone: { number: orderData.customerDetails.phone },
          },
          back_urls: {
-             success: `${frontendUrl}/payment-success`,
-             failure: `${frontendUrl}/payment-failure`,
-             pending: `${frontendUrl}/payment-pending`,
+             success: `${frontendUrl}/payment-success?order_id=${orderId}`,
+             failure: `${frontendUrl}/payment-failure?order_id=${orderId}`,
+             pending: `${frontendUrl}/payment-pending?order_id=${orderId}`,
          },
          auto_return: 'approved',
          notification_url: `${backendUrl}/api/mercadopago-webhook?source_news=webhooks&orderId=${orderId}`,
@@ -98,37 +119,107 @@ app.post('/api/create-preference', async (req, res) => {
 
     await ordersCollection.updateOne(
         { _id: orderId },
-        { $set: { preferenceId: mpPreference.id, status: 'pending_payment' } }
+        {
+            $set: {
+                'paymentDetails.mercadoPagoPreferenceId': mpPreference.id,
+                status: 'pending_payment',
+                updatedAt: new Date()
+            }
+        }
     );
     res.status(201).json({ preferenceId: mpPreference.id });
 
   } catch (error) {
     console.error('Error detallado al crear preferencia:', error?.cause || error);
-    res.status(500).json({ message: error.message || 'Error interno del servidor al crear la preferencia' });
+    let errorMessage = 'Error interno del servidor al crear la preferencia';
+    if (error.message) {
+        errorMessage = error.message;
+    } else if (typeof error === 'string') {
+        errorMessage = error;
+    }
+    res.status(500).json({ message: errorMessage });
   }
 });
 
 
 app.post('/api/mercadopago-webhook', async (req, res) => {
-  console.log("Webhook recibido:", req.query, req.body);
+  console.log("Webhook recibido:", req.query);
+
   const { query, body } = req;
   const topic = query.topic || query.type;
   const orderIdFromQuery = query.orderId;
 
   console.log(`Webhook: topic=${topic}, orderId=${orderIdFromQuery}`);
 
+
   if (topic === 'payment') {
       const paymentId = query.id || body?.data?.id;
       console.log(`Payment ID recibido: ${paymentId}`);
-      if(orderIdFromQuery && db) {
+
+      if(orderIdFromQuery && paymentId && db) {
           try {
               const orderObjectId = new ObjectId(orderIdFromQuery);
               const ordersCollection = db.collection('orders');
-              console.log(`Webhook procesado (simulado) para orden ${orderIdFromQuery}`);
+
+              console.log(`Procesando webhook para pago ${paymentId}, Orden ${orderIdFromQuery}`);
+
+              // --- IMPORTANTE: Aquí deberías consultar el pago a MercadoPago ---
+              // const paymentInfo = await payment.get({ id: paymentId }); // Usando el SDK de MP
+              // const paymentStatus = paymentInfo?.status; // ej. 'approved', 'rejected'
+              // const externalReference = paymentInfo?.external_reference;
+
+              // --- SIMULACIÓN (Reemplaza con la consulta real a MP) ---
+              const paymentStatus = 'approved';
+              console.warn(`!!! SIMULANDO estado de pago '${paymentStatus}' para ${paymentId}. Implementa consulta real a MP !!!`);
+              // --- FIN SIMULACIÓN ---
+
+
+              if (paymentStatus === 'approved') {
+                 const updateResult = await ordersCollection.updateOne(
+                      { _id: orderObjectId, status: { $ne: 'paid' } },
+                      {
+                          $set: {
+                              status: 'paid',
+                              'paymentDetails.mercadoPagoPaymentId': paymentId.toString(),
+                              'paymentDetails.paymentStatus': paymentStatus,
+                              'paymentDetails.paidAt': new Date(),
+                              updatedAt: new Date()
+                          }
+                      }
+                  );
+                  if (updateResult.modifiedCount > 0) {
+                      console.log(`Orden ${orderIdFromQuery} actualizada a PAGADA.`);
+                  } else {
+                      console.log(`Orden ${orderIdFromQuery} no actualizada (quizás ya estaba pagada o no se encontró).`);
+                  }
+
+              } else if (paymentStatus === 'rejected' || paymentStatus === 'cancelled' || paymentStatus === 'refunded') {
+                   const updateResult = await ordersCollection.updateOne(
+                      { _id: orderObjectId },
+                      {
+                          $set: {
+                              status: 'failed',
+                              'paymentDetails.mercadoPagoPaymentId': paymentId.toString(),
+                              'paymentDetails.paymentStatus': paymentStatus,
+                              updatedAt: new Date()
+                          }
+                      }
+                  );
+                   if (updateResult.modifiedCount > 0) {
+                      console.log(`Orden ${orderIdFromQuery} actualizada a FALLIDA/RECHAZADA.`);
+                  }
+              } else {
+                   console.log(`Estado de pago '${paymentStatus}' recibido para orden ${orderIdFromQuery}, no requiere acción inmediata de estado.`);
+              }
+
           } catch (err) {
               console.error(`Error procesando webhook para orden ${orderIdFromQuery}:`, err);
           }
+      } else {
+         console.log("Webhook ignorado: Faltan datos (orderId, paymentId) o conexión a DB.");
       }
+  } else {
+      console.log(`Webhook ignorado: Tópico no manejado '${topic}'`);
   }
 
   res.sendStatus(200);
@@ -141,5 +232,5 @@ app.use((err, req, res, next) => {
 
 
 app.listen(port, () => {
-  console.log(`Backend escuchando en ${backendUrl}`);
+  console.log(`Backend escuchando en ${backendUrl} (Puerto: ${port})`);
 });
