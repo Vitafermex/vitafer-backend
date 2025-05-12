@@ -28,22 +28,27 @@ const clientMongo = new MongoClient(mongoUri);
 async function connectDB() {
   try {
     await clientMongo.connect();
-    const dbName = new URL(mongoUri).pathname.substring(1);
-    db = clientMongo.db(dbName || undefined); 
-    if (!db.databaseName) {
-        console.warn("Advertencia: No se pudo determinar el nombre de la base de datos desde MONGO_URI. Asegúrate de incluirlo en la URI o especificarlo en clientMongo.db('tu_db').");
-    }
-    console.log(`Conectado a MongoDB Atlas - DB: ${db.databaseName}`);
+    // --- Especifica el nombre de tu base de datos aquí ---
+    const dbName = 'vitafer';
+    db = clientMongo.db(dbName);
+    console.log(`Conectado a MongoDB Atlas - Usando DB: ${db.databaseName}`);
+
+    // Intenta hacer ping para confirmar la conexión a la base de datos específica
+    await db.command({ ping: 1 });
+    console.log(`Ping a la base de datos "${dbName}" exitoso.`);
+
   } catch (error) {
-    console.error("Error conectando a MongoDB:", error);
+    // Si falla aquí, puede ser problema con la URI, permisos del usuario, o red.
+    console.error(`Error conectando a MongoDB o a la base de datos "${'vitafer'}":`, error);
     process.exit(1);
   }
 }
-connectDB();
+connectDB(); // Llama a la función para conectar al iniciar
 
 const mpClient = new MercadoPagoConfig({ accessToken: mpAccessToken });
 const preference = new Preference(mpClient);
 
+// --- Endpoint para Crear Orden y Preferencia de Pago ---
 app.post('/api/create-preference', async (req, res) => {
   const orderData = req.body;
 
@@ -54,6 +59,7 @@ app.post('/api/create-preference', async (req, res) => {
       return res.status(400).json({ message: 'Datos de la orden inválidos o incompletos' });
   }
 
+  // --- Asegúrate de usar el nombre correcto de la colección aquí ---
   const ordersCollection = db.collection('orders');
 
   try {
@@ -63,10 +69,10 @@ app.post('/api/create-preference', async (req, res) => {
             name: item.name,
             presentation: item.presentation,
             quantity: item.quantity,
-            unitPrice: item.unit_price,
-            totalItemPrice: item.quantity * item.unit_price
+            unitPrice: parseFloat(item.unit_price) || 0, // Asegura que sea número
+            totalItemPrice: item.quantity * (parseFloat(item.unit_price) || 0)
         })),
-        totalAmount: orderData.totalAmount,
+        totalAmount: orderData.totalAmount, // Asegúrate que esto también sea número
         status: 'pending_preference',
         paymentDetails: {
             method: 'mercadopago',
@@ -83,19 +89,33 @@ app.post('/api/create-preference', async (req, res) => {
         createdAt: new Date(),
         updatedAt: new Date()
     };
+
+    // Valida que totalAmount sea número antes de insertar
+     if (isNaN(newOrder.totalAmount)) {
+        console.error("Error: totalAmount no es un número válido", orderData.totalAmount);
+        return res.status(400).json({ message: 'El monto total de la orden es inválido.' });
+     }
+     // Valida que todos los unitPrice sean números
+     if (newOrder.items.some(item => isNaN(item.unitPrice))) {
+        console.error("Error: Al menos un unitPrice no es un número válido", newOrder.items);
+        return res.status(400).json({ message: 'Uno o más precios unitarios son inválidos.' });
+     }
+
+
     const savedOrder = await ordersCollection.insertOne(newOrder);
     const orderId = savedOrder.insertedId;
 
-    console.log(`Orden ${orderId} creada en MongoDB.`);
+    console.log(`Orden ${orderId} creada en colección "orders" de DB "vitafer".`);
 
+    // --- Creación de Preferencia MP (asegurando unit_price como número) ---
     const preferenceData = {
        body: {
-         items: orderData.items.map(item => ({
+         items: newOrder.items.map(item => ({ // Usa los items ya validados/parseados
            id: item.name.substring(0, 100),
            title: item.name,
            description: item.presentation || '',
            quantity: item.quantity,
-           unit_price: item.unit_price,
+           unit_price: item.unitPrice, // Ya es número
            currency_id: 'MXN',
          })),
          payer: {
@@ -108,15 +128,16 @@ app.post('/api/create-preference', async (req, res) => {
              failure: `${frontendUrl}/payment-failure?order_id=${orderId}`,
              pending: `${frontendUrl}/payment-pending?order_id=${orderId}`,
          },
-         auto_return: 'approved',
          notification_url: `${backendUrl}/api/mercadopago-webhook?source_news=webhooks&orderId=${orderId}`,
          external_reference: orderId.toString(),
        }
     };
 
+    console.log("Enviando datos a MercadoPago:", JSON.stringify(preferenceData, null, 2)); // Log para ver qué se envía a MP
     const mpPreference = await preference.create(preferenceData);
     console.log(`Preferencia ${mpPreference.id} creada para orden ${orderId}`);
 
+    // --- Actualizar Orden con Preference ID ---
     await ordersCollection.updateOne(
         { _id: orderId },
         {
@@ -132,25 +153,26 @@ app.post('/api/create-preference', async (req, res) => {
   } catch (error) {
     console.error('Error detallado al crear preferencia:', error?.cause || error);
     let errorMessage = 'Error interno del servidor al crear la preferencia';
-    if (error.message) {
+    // Intenta extraer el mensaje específico de MercadoPago si existe
+    if (error?.cause?.[0]?.description) {
+        errorMessage = error.cause[0].description;
+    } else if (error.message) {
         errorMessage = error.message;
     } else if (typeof error === 'string') {
         errorMessage = error;
     }
-    res.status(500).json({ message: errorMessage });
+    // Devuelve el error más específico si lo hay
+    res.status(error.status || 500).json({ message: errorMessage });
   }
 });
 
 
+// --- Endpoint Webhook (actualizado para usar colección correcta) ---
 app.post('/api/mercadopago-webhook', async (req, res) => {
   console.log("Webhook recibido:", req.query);
-
   const { query, body } = req;
   const topic = query.topic || query.type;
   const orderIdFromQuery = query.orderId;
-
-  console.log(`Webhook: topic=${topic}, orderId=${orderIdFromQuery}`);
-
 
   if (topic === 'payment') {
       const paymentId = query.id || body?.data?.id;
@@ -159,20 +181,13 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
       if(orderIdFromQuery && paymentId && db) {
           try {
               const orderObjectId = new ObjectId(orderIdFromQuery);
-              const ordersCollection = db.collection('orders');
+              const ordersCollection = db.collection('orders'); // Usa la colección correcta
 
               console.log(`Procesando webhook para pago ${paymentId}, Orden ${orderIdFromQuery}`);
 
-              // --- IMPORTANTE: Aquí deberías consultar el pago a MercadoPago ---
-              // const paymentInfo = await payment.get({ id: paymentId }); // Usando el SDK de MP
-              // const paymentStatus = paymentInfo?.status; // ej. 'approved', 'rejected'
-              // const externalReference = paymentInfo?.external_reference;
-
-              // --- SIMULACIÓN (Reemplaza con la consulta real a MP) ---
-              const paymentStatus = 'approved';
+              // --- IMPORTANTE: Implementar consulta REAL a MP aquí ---
+              const paymentStatus = 'approved'; // !!! SIMULACIÓN !!!
               console.warn(`!!! SIMULANDO estado de pago '${paymentStatus}' para ${paymentId}. Implementa consulta real a MP !!!`);
-              // --- FIN SIMULACIÓN ---
-
 
               if (paymentStatus === 'approved') {
                  const updateResult = await ordersCollection.updateOne(
@@ -187,27 +202,14 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
                           }
                       }
                   );
-                  if (updateResult.modifiedCount > 0) {
-                      console.log(`Orden ${orderIdFromQuery} actualizada a PAGADA.`);
-                  } else {
-                      console.log(`Orden ${orderIdFromQuery} no actualizada (quizás ya estaba pagada o no se encontró).`);
-                  }
+                  if (updateResult.modifiedCount > 0) console.log(`Orden ${orderIdFromQuery} actualizada a PAGADA.`);
+                  else console.log(`Orden ${orderIdFromQuery} no actualizada (quizás ya estaba pagada o no se encontró).`);
 
               } else if (paymentStatus === 'rejected' || paymentStatus === 'cancelled' || paymentStatus === 'refunded') {
                    const updateResult = await ordersCollection.updateOne(
-                      { _id: orderObjectId },
-                      {
-                          $set: {
-                              status: 'failed',
-                              'paymentDetails.mercadoPagoPaymentId': paymentId.toString(),
-                              'paymentDetails.paymentStatus': paymentStatus,
-                              updatedAt: new Date()
-                          }
-                      }
+                      { _id: orderObjectId }, { $set: { status: 'failed', 'paymentDetails.mercadoPagoPaymentId': paymentId.toString(), 'paymentDetails.paymentStatus': paymentStatus, updatedAt: new Date() } }
                   );
-                   if (updateResult.modifiedCount > 0) {
-                      console.log(`Orden ${orderIdFromQuery} actualizada a FALLIDA/RECHAZADA.`);
-                  }
+                   if (updateResult.modifiedCount > 0) console.log(`Orden ${orderIdFromQuery} actualizada a FALLIDA/RECHAZADA.`);
               } else {
                    console.log(`Estado de pago '${paymentStatus}' recibido para orden ${orderIdFromQuery}, no requiere acción inmediata de estado.`);
               }
@@ -225,11 +227,11 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
+// --- Middleware y Listener (sin cambios) ---
 app.use((err, req, res, next) => {
     console.error("Error no manejado:", err.stack);
     res.status(500).json({ message: 'Error interno del servidor' });
 });
-
 
 app.listen(port, () => {
   console.log(`Backend escuchando en ${backendUrl} (Puerto: ${port})`);
