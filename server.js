@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
-const { MercadoPagoConfig, Preference, Payment } = require('mercadopago'); // Importa Payment
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
 const app = express();
 
@@ -26,9 +26,9 @@ let db;
 const clientMongo = new MongoClient(mongoUri);
 
 async function connectDB() {
+  const dbName = 'vitafer';
   try {
     await clientMongo.connect();
-    const dbName = 'vitafer';
     db = clientMongo.db(dbName);
     console.log(`Conectado a MongoDB Atlas - Usando DB: ${db.databaseName}`);
     await db.command({ ping: 1 });
@@ -42,7 +42,7 @@ connectDB();
 
 const mpClient = new MercadoPagoConfig({ accessToken: mpAccessToken });
 const preference = new Preference(mpClient);
-const payment = new Payment(mpClient); // Crea una instancia del cliente de Payment
+const payment = new Payment(mpClient);
 
 app.post('/api/create-preference', async (req, res) => {
   const orderData = req.body;
@@ -55,7 +55,6 @@ app.post('/api/create-preference', async (req, res) => {
   }
 
   const ordersCollection = db.collection('orders');
-
   try {
     const newOrder = {
         customerDetails: orderData.customerDetails,
@@ -96,8 +95,8 @@ app.post('/api/create-preference', async (req, res) => {
     const preferenceData = {
        body: {
          items: newOrder.items.map(item => ({
-           id: item.name.substring(0, 250), // Límite de ID de MP
-           title: item.name.substring(0, 250), // Límite de título de MP
+           id: item.name.substring(0, 250),
+           title: item.name.substring(0, 250),
            description: (item.presentation || '').substring(0, 250),
            quantity: item.quantity,
            unit_price: item.unitPrice,
@@ -117,7 +116,7 @@ app.post('/api/create-preference', async (req, res) => {
          external_reference: orderId.toString(),
        }
     };
-    if (process.env.AUTO_RETURN_MP === 'approved') { // Opcional: si quieres controlar auto_return por .env
+    if (process.env.AUTO_RETURN_MP === 'approved') {
         preferenceData.body.auto_return = 'approved';
     }
 
@@ -128,26 +127,15 @@ app.post('/api/create-preference', async (req, res) => {
 
     await ordersCollection.updateOne(
         { _id: orderId },
-        {
-            $set: {
-                'paymentDetails.mercadoPagoPreferenceId': mpPreference.id,
-                status: 'pending_payment',
-                updatedAt: new Date()
-            }
-        }
+        { $set: { 'paymentDetails.mercadoPagoPreferenceId': mpPreference.id, status: 'pending_payment', updatedAt: new Date() } }
     );
     res.status(201).json({ mercadoPagoUrl: mpPreference.init_point });
   } catch (error) {
     console.error('Error detallado al crear preferencia:', error.cause || error.message || error);
     let errorMessage = 'Error interno del servidor al crear la preferencia';
-    // MercadoPago a veces devuelve el error en error.cause.error
     const mpError = error.cause?.error || error.cause || error.message;
-    if (typeof mpError === 'string') {
-        errorMessage = mpError;
-    } else if (mpError?.message) {
-        errorMessage = mpError.message;
-    }
-
+    if (typeof mpError === 'string') { errorMessage = mpError; }
+    else if (mpError?.message) { errorMessage = mpError.message; }
     res.status(error.status || 500).json({ message: errorMessage });
   }
 });
@@ -157,35 +145,31 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
   console.log("Webhook body:", req.body);
 
   const { query, body } = req;
-  const topic = query.topic || query.type; // MP usa 'type' para notificaciones IPN y 'topic' para Webhooks
+  const topic = query.topic || query.type;
   const orderIdFromQuery = query.orderId;
 
   if (topic === 'payment' || body?.type === 'payment') {
     const paymentId = body?.data?.id;
-
     console.log(`Webhook: Notificación de pago recibida. Payment ID: ${paymentId}, Order ID de query: ${orderIdFromQuery}`);
 
     if (paymentId && db) {
       try {
         console.log(`Consultando estado del pago ${paymentId} a MercadoPago...`);
         const paymentInfoResult = await payment.get({ id: paymentId.toString() });
-        
         console.log("Respuesta de MP al consultar pago:", JSON.stringify(paymentInfoResult, null, 2));
 
-        const paymentData = paymentInfoResult; // El SDK v2 devuelve el objeto directamente
+        const paymentData = paymentInfoResult;
         const paymentStatus = paymentData?.status;
-        const externalReference = paymentData?.external_reference; // Este es tu orderId
+        const externalReference = paymentData?.external_reference;
 
         let orderObjectId;
-
-        if (externalReference) { // Prioriza external_reference
-            orderObjectId = new ObjectId(externalReference);
-        } else if (orderIdFromQuery) {
+        if (externalReference) { orderObjectId = new ObjectId(externalReference); }
+        else if (orderIdFromQuery) {
             console.warn(`Usando orderId de query param para webhook, external_reference no encontrado o diferente en pago ${paymentId}.`);
             orderObjectId = new ObjectId(orderIdFromQuery);
         } else {
             console.error(`Error: No se pudo determinar el ID de la orden desde el webhook para pago ${paymentId}.`);
-            return res.sendStatus(200); // Responde OK a MP, pero no podemos procesar.
+            return res.sendStatus(200);
         }
         
         const ordersCollection = db.collection('orders');
@@ -194,7 +178,7 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
         let newOrderStatus;
         let paymentDetailsUpdate = {
             'paymentDetails.mercadoPagoPaymentId': paymentId.toString(),
-            'paymentDetails.paymentStatus': paymentStatus, // Estado real de MP
+            'paymentDetails.paymentStatus': paymentStatus,
             updatedAt: new Date()
         };
 
@@ -204,10 +188,9 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
         } else if (['rejected', 'cancelled', 'refunded', 'charged_back'].includes(paymentStatus)) {
           newOrderStatus = 'failed';
         } else if (paymentStatus === 'in_process' || paymentStatus === 'pending') {
-          newOrderStatus = 'pending_payment'; // O un estado más específico como 'processing'
+          newOrderStatus = 'pending_payment';
         } else {
           console.log(`Estado de pago '${paymentStatus}' no reconocido o no requiere cambio de estado principal para orden ${orderObjectId}.`);
-          // Solo actualizamos paymentDetails.paymentStatus si no es un estado final
           await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate });
           return res.sendStatus(200);
         }
@@ -215,10 +198,9 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
         if (newOrderStatus) {
            paymentDetailsUpdate.status = newOrderStatus;
            const updateResult = await ordersCollection.updateOne(
-                { _id: orderObjectId }, // No condicionar por status si MP puede enviar varios webhooks
+                { _id: orderObjectId },
                 { $set: paymentDetailsUpdate }
             );
-
             if (updateResult.modifiedCount > 0) {
                 console.log(`Orden ${orderObjectId} actualizada a ${newOrderStatus} basado en el pago ${paymentId}.`);
             } else {
@@ -226,7 +208,6 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
                 console.log(`Orden ${orderObjectId} no actualizada por el webhook (modCount: ${updateResult.modifiedCount}). Estado actual: ${existingOrder?.status}. Estado MP: ${paymentStatus}.`);
             }
         }
-
       } catch (err) {
         console.error(`Error procesando webhook para pago ${paymentId}:`, err.cause || err.message || err);
       }
