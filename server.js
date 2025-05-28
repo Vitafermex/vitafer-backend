@@ -10,16 +10,28 @@ const app = express();
 const port = process.env.PORT || 3000;
 const mongoUri = process.env.MONGO_URI;
 const mpAccessToken = process.env.MERCADOPAGO_ACCESS_TOKEN;
-const frontendUrl = process.env.FRONTEND_URL;
 const backendUrl = process.env.BACKEND_URL;
 
-if (!mongoUri || !mpAccessToken || !frontendUrl || !backendUrl) {
-  console.error("Error: Variables de entorno esenciales faltantes.");
+// Define los orígenes permitidos
+const allowedOrigins = [
+  'https://vitafermex.com',
+  'https://www.vitafermex.com'
+];
+
+if (!mongoUri || !mpAccessToken || !process.env.FRONTEND_URL || !backendUrl) {
+  console.error("Error: Faltan variables de entorno esenciales (MONGO_URI, MERCADOPAGO_ACCESS_TOKEN, FRONTEND_URL para referencia, BACKEND_URL).");
   process.exit(1);
 }
 
 app.use(cors({
-  origin: frontendUrl,
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn(`Origen no permitido por CORS: ${origin}`);
+      callback(new Error('Origen no permitido por CORS'));
+    }
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -64,47 +76,21 @@ app.post('/api/auth/dispatcher/login', async (req, res) => {
 });
 
 const ensureDispatcherAuthenticated = (req, res, next) => {
+  console.warn("ADVERTENCIA: Ruta de despachador no está protegida adecuadamente en este momento.");
   next();
 };
 
 const getOrdersWithEmployeeData = async (statusCriteria, sortCriteria) => {
-    const ordersCollection = db.collection('orders');
-    const aggregationPipeline = [
-        { $match: statusCriteria },
-        {
-            $lookup: {
-                from: "employees", 
-                localField: "referralCode", 
-                foreignField: "referralCode", 
-                as: "referredByEmployeeInfo"
-            }
-        },
-        {
-            $unwind: { 
-                path: "$referredByEmployeeInfo",
-                preserveNullAndEmptyArrays: true
-            }
-        },
-        {
-             $project: {
-                customerDetails: 1,
-                items: 1,
-                totalAmount: 1,
-                status: 1,
-                paymentDetails: 1,
-                shippingDetails: 1,
-                createdAt: 1,
-                updatedAt: 1,
-                shippedAt: 1,
-                referralCode: 1,
-                referredByEmployeeName: "$referredByEmployeeInfo.name"
-            }
-        },
-        { $sort: sortCriteria }
-    ];
-    return await ordersCollection.aggregate(aggregationPipeline).toArray();
+  const ordersCollection = db.collection('orders');
+  const aggregationPipeline = [
+    { $match: statusCriteria },
+    { $lookup: { from: "employees", localField: "referralCode", foreignField: "referralCode", as: "referredByEmployeeInfo" } },
+    { $unwind: { path: "$referredByEmployeeInfo", preserveNullAndEmptyArrays: true } },
+    { $project: { customerDetails: 1, items: 1, totalAmount: 1, status: 1, paymentDetails: 1, shippingDetails: 1, createdAt: 1, updatedAt: 1, shippedAt: 1, referralCode: 1, referredByEmployeeName: "$referredByEmployeeInfo.name" } },
+    { $sort: sortCriteria }
+  ];
+  return await ordersCollection.aggregate(aggregationPipeline).toArray();
 };
-
 
 app.get('/api/dispatcher/orders/pending', ensureDispatcherAuthenticated, async (req, res) => {
   if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
@@ -128,7 +114,6 @@ app.get('/api/dispatcher/orders/shipped', ensureDispatcherAuthenticated, async (
   }
 });
 
-// Rutas PUT /dispatch y /unship (sin cambios en su lógica interna, pero se beneficiarán si las órdenes ya vienen con info de empleado)
 app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated, async (req, res) => {
   if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
   const { orderId } = req.params;
@@ -145,8 +130,8 @@ app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated
     else { updateData['shippingDetails.trackingNumber'] = null; }
     const result = await ordersCollection.updateOne({ _id: orderObjectId, status: 'paid' }, { $set: updateData });
     if (result.modifiedCount === 0) return res.status(404).json({ message: 'Orden no encontrada o ya no está en estado "paid"' });
-    const updatedOrder = await getOrdersWithEmployeeData({ _id: orderObjectId }, {}); // Obtiene la orden actualizada con info del empleado
-    res.status(200).json({ message: 'Orden marcada como despachada', order: updatedOrder[0] || null });
+    const updatedOrderData = await getOrdersWithEmployeeData({ _id: orderObjectId }, {});
+    res.status(200).json({ message: 'Orden marcada como despachada', order: updatedOrderData[0] || null });
   } catch (error) {
     console.error(`Error al marcar orden ${orderId} como despachada:`, error);
     res.status(500).json({ message: 'Error interno del servidor' });
@@ -154,46 +139,47 @@ app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated
 });
 
 app.put('/api/dispatcher/order/:orderId/unship', ensureDispatcherAuthenticated, async (req, res) => {
-    if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
-    const { orderId } = req.params;
-    if (!ObjectId.isValid(orderId)) return res.status(400).json({ message: 'ID de orden inválido' });
-    try {
-        const ordersCollection = db.collection('orders');
-        const orderObjectId = new ObjectId(orderId);
-        const orderToUnship = await ordersCollection.findOne({ _id: orderObjectId });
-        if (!orderToUnship) return res.status(404).json({ message: 'Orden no encontrada' });
-        if (orderToUnship.status !== 'shipped') return res.status(400).json({ message: `La orden no está en estado 'shipped'.` });
-        const updateData = { status: 'paid', shippedAt: null, 'shippingDetails.trackingNumber': null, updatedAt: new Date() };
-        const result = await ordersCollection.updateOne({ _id: orderObjectId, status: 'shipped' }, { $set: updateData });
-        if (result.modifiedCount === 0) return res.status(404).json({ message: 'Orden no encontrada o ya no está en estado "shipped"' });
-        const updatedOrder = await getOrdersWithEmployeeData({ _id: orderObjectId }, {}); // Obtiene la orden actualizada con info del empleado
-        res.status(200).json({ message: 'Despacho de orden revertido', order: updatedOrder[0] || null });
-    } catch (error) {
-        console.error(`Error al revertir despacho de orden ${orderId}:`, error);
-        res.status(500).json({ message: 'Error interno del servidor' });
-    }
+  if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
+  const { orderId } = req.params;
+  if (!ObjectId.isValid(orderId)) return res.status(400).json({ message: 'ID de orden inválido' });
+  try {
+    const ordersCollection = db.collection('orders');
+    const orderObjectId = new ObjectId(orderId);
+    const orderToUnship = await ordersCollection.findOne({ _id: orderObjectId });
+    if (!orderToUnship) return res.status(404).json({ message: 'Orden no encontrada' });
+    if (orderToUnship.status !== 'shipped') return res.status(400).json({ message: `La orden no está en estado 'shipped'.` });
+    const updateData = { status: 'paid', shippedAt: null, 'shippingDetails.trackingNumber': null, updatedAt: new Date() };
+    const result = await ordersCollection.updateOne({ _id: orderObjectId, status: 'shipped' }, { $set: updateData });
+    if (result.modifiedCount === 0) return res.status(404).json({ message: 'Orden no encontrada o ya no está en estado "shipped"' });
+    const updatedOrderData = await getOrdersWithEmployeeData({ _id: orderObjectId }, {});
+    res.status(200).json({ message: 'Despacho de orden revertido', order: updatedOrderData[0] || null });
+  } catch (error) {
+    console.error(`Error al revertir despacho de orden ${orderId}:`, error);
+    res.status(500).json({ message: 'Error interno del servidor' });
+  }
 });
 
-// Endpoint de Crear Preferencia (sin cambios funcionales, pero la orden se guarda con referralCode)
 app.post('/api/create-preference', async (req, res) => {
   const orderData = req.body;
+  const currentFrontendUrl = req.get('origin');
+
   if (!db) return res.status(500).json({ message: 'Error interno: Sin conexión a base de datos' });
   if (!orderData || !orderData.customerDetails || !orderData.items || orderData.items.length === 0) {
-      return res.status(400).json({ message: 'Datos de la orden inválidos o incompletos' });
+    return res.status(400).json({ message: 'Datos de la orden inválidos o incompletos' });
   }
   const ordersCollection = db.collection('orders');
   try {
     const newOrder = {
-        customerDetails: orderData.customerDetails,
-        items: orderData.items.map(item => ({
-            name: item.name, presentation: item.presentation, quantity: item.quantity,
-            unitPrice: parseFloat(item.unit_price) || 0, totalItemPrice: item.quantity * (parseFloat(item.unit_price) || 0)
-        })),
-        totalAmount: parseFloat(orderData.totalAmount) || 0, status: 'pending_preference',
-        paymentDetails: { method: 'mercadopago', mercadoPagoPreferenceId: null, mercadoPagoPaymentId: null, paymentStatus: 'pending', paidAt: null },
-        shippingDetails: { method: "Por definir", cost: 0, trackingNumber: null },
-        createdAt: new Date(), updatedAt: new Date(),
-        referralCode: orderData.referralCode || '001'
+      customerDetails: orderData.customerDetails,
+      items: orderData.items.map(item => ({
+        name: item.name, presentation: item.presentation, quantity: item.quantity,
+        unitPrice: parseFloat(item.unit_price) || 0, totalItemPrice: item.quantity * (parseFloat(item.unit_price) || 0)
+      })),
+      totalAmount: parseFloat(orderData.totalAmount) || 0, status: 'pending_preference',
+      paymentDetails: { method: 'mercadopago', mercadoPagoPreferenceId: null, mercadoPagoPaymentId: null, paymentStatus: 'pending', paidAt: null },
+      shippingDetails: { method: "Por definir", cost: 0, trackingNumber: null },
+      createdAt: new Date(), updatedAt: new Date(),
+      referralCode: orderData.referralCode || null
     };
     if (isNaN(newOrder.totalAmount)) return res.status(400).json({ message: 'El monto total de la orden es inválido.' });
     if (newOrder.items.some(item => isNaN(item.unitPrice))) return res.status(400).json({ message: 'Uno o más precios unitarios son inválidos.' });
@@ -201,29 +187,30 @@ app.post('/api/create-preference', async (req, res) => {
     const savedOrder = await ordersCollection.insertOne(newOrder);
     const orderId = savedOrder.insertedId;
     console.log(`Orden ${orderId} creada (Referido: ${newOrder.referralCode || 'Ninguno'}) en DB.`);
+    const effectiveFrontendUrl = allowedOrigins.includes(currentFrontendUrl) ? currentFrontendUrl : allowedOrigins[0];
 
     const preferenceData = {
-       body: {
-         items: newOrder.items.map(item => ({
-           id: item.name.substring(0, 250), title: item.name.substring(0, 250), description: (item.presentation || '').substring(0, 250),
-           quantity: item.quantity, unit_price: item.unitPrice, currency_id: 'MXN',
-         })),
-         payer: { name: orderData.customerDetails.name, email: orderData.customerDetails.email, phone: { number: orderData.customerDetails.phone }, },
-         back_urls: {
-             success: `${frontendUrl}/payment-success?order_id=${orderId.toString()}`,
-             failure: `${frontendUrl}/payment-failure?order_id=${orderId.toString()}`,
-             pending: `${frontendUrl}/payment-pending?order_id=${orderId.toString()}`,
-         },
-         notification_url: `${backendUrl}/api/mercadopago-webhook?source_news=webhooks&orderId=${orderId.toString()}`,
-         external_reference: orderId.toString(),
-       }
+      body: {
+        items: newOrder.items.map(item => ({
+          id: item.name.substring(0, 250), title: item.name.substring(0, 250), description: (item.presentation || '').substring(0, 250),
+          quantity: item.quantity, unit_price: item.unitPrice, currency_id: 'MXN',
+        })),
+        payer: { name: orderData.customerDetails.name, email: orderData.customerDetails.email, phone: { number: orderData.customerDetails.phone }, },
+        back_urls: {
+          success: `${effectiveFrontendUrl}/payment-success?order_id=${orderId.toString()}`,
+          failure: `${effectiveFrontendUrl}/payment-failure?order_id=${orderId.toString()}`,
+          pending: `${effectiveFrontendUrl}/payment-pending?order_id=${orderId.toString()}`,
+        },
+        notification_url: `${backendUrl}/api/mercadopago-webhook?source_news=webhooks&orderId=${orderId.toString()}`,
+        external_reference: orderId.toString(),
+      }
     };
     if (process.env.AUTO_RETURN_MP === 'approved') { preferenceData.body.auto_return = 'approved'; }
 
     const mpPreference = await preference.create(preferenceData);
     await ordersCollection.updateOne(
-        { _id: orderId },
-        { $set: { 'paymentDetails.mercadoPagoPreferenceId': mpPreference.id, status: 'pending_payment', updatedAt: new Date() } }
+      { _id: orderId },
+      { $set: { 'paymentDetails.mercadoPagoPreferenceId': mpPreference.id, status: 'pending_payment', updatedAt: new Date() } }
     );
     res.status(201).json({ mercadoPagoUrl: mpPreference.init_point });
   } catch (error) {
@@ -266,10 +253,22 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
         else if (paymentStatus === 'in_process' || paymentStatus === 'pending') { newOrderStatus = 'pending_payment'; }
         else { console.log(`Estado de pago '${paymentStatus}' no reconocido...`); await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate }); return res.sendStatus(200); }
         if (newOrderStatus) {
-           paymentDetailsUpdate.status = newOrderStatus;
-           const updateResult = await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate });
-           if (updateResult.modifiedCount > 0) { console.log(`Orden ${orderObjectId} actualizada a ${newOrderStatus}...`); }
-           else { const existingOrder = await ordersCollection.findOne({ _id: orderObjectId }); console.log(`Orden ${orderObjectId} no actualizada por webhook... Estado actual: ${existingOrder?.status}. Estado MP: ${paymentStatus}.`); }
+          paymentDetailsUpdate.status = newOrderStatus;
+          const updateResult = await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate });
+          if (updateResult.modifiedCount > 0) {
+            console.log(`Orden ${orderObjectId} actualizada a ${newOrderStatus}...`);
+            if (newOrderStatus === 'paid') {
+              const updatedOrderForEmail = await ordersCollection.findOne({ _id: orderObjectId });
+              if (updatedOrderForEmail && updatedOrderForEmail.customerDetails?.email) {
+                const emailOrderDetails = {
+                  id: updatedOrderForEmail._id.toString(), customerName: updatedOrderForEmail.customerDetails.name,
+                  items: updatedOrderForEmail.items, totalAmount: updatedOrderForEmail.totalAmount,
+                  customerDetails: updatedOrderForEmail.customerDetails,
+                  formatPrice: (value) => value.toLocaleString('es-MX', { style: 'currency', currency: 'MXN', minimumFractionDigits: 0 }) // Formateador simple
+                };
+              } else { console.error("No se pudo enviar email: falta email del cliente o datos de la orden para orden ID:", orderObjectId); }
+            }
+          } else { const existingOrder = await ordersCollection.findOne({ _id: orderObjectId }); console.log(`Orden ${orderObjectId} no actualizada por webhook... Estado actual: ${existingOrder?.status}. Estado MP: ${paymentStatus}.`); }
         }
       } catch (err) { console.error(`Error procesando webhook para pago ${paymentId}:`, err.cause || err.message || err); }
     } else { console.log("Webhook ignorado: Faltan paymentId o conexión a DB."); }
@@ -278,8 +277,8 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    console.error("Error no manejado:", err.stack);
-    res.status(500).json({ message: 'Error interno del servidor' });
+  console.error("Error no manejado:", err.stack);
+  res.status(500).json({ message: 'Error interno del servidor' });
 });
 
 app.listen(port, () => {
