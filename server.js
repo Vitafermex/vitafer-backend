@@ -4,25 +4,24 @@ const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const bcrypt = require('bcryptjs');
-// const { sendOrderConfirmationEmail } = require('./services/emailService'); // Mantén comentado si no lo tienes
-// const { formatMXN } = require('./utils/formatters'); // Mantén comentado si no lo tienes
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
 const port = process.env.PORT || 3000;
 const mongoUri = process.env.MONGO_URI;
 const mpAccessToken = process.env.MERCADOPAGO_ACCESS_TOKEN;
-const frontendUrl = process.env.FRONTEND_URL; // Sigue siendo usado para las back_urls
+const frontendUrl = process.env.FRONTEND_URL;
 const backendUrl = process.env.BACKEND_URL;
+const jwtSecret = process.env.JWT_SECRET;
 
 const allowedOrigins = [
   'https://vitafermex.com',
   'https://www.vitafermex.com',
-  'http://localhost:5173' // Para desarrollo local, si lo necesitas
+  'http://localhost:5173'
 ];
 
-if (!mongoUri || !mpAccessToken || !process.env.FRONTEND_URL || !backendUrl) {
-  console.error("Error: Faltan variables de entorno esenciales (MONGO_URI, MERCADOPAGO_ACCESS_TOKEN, FRONTEND_URL para referencia, BACKEND_URL).");
+if (!mongoUri || !mpAccessToken || !frontendUrl || !backendUrl || !jwtSecret) {
   process.exit(1);
 }
 
@@ -31,8 +30,7 @@ app.use(cors({
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      console.warn(`Origen no permitido por CORS: ${origin}`);
-      callback(new Error('Origen no permitido por CORS'));
+      callback(null, true); 
     }
   },
   credentials: true
@@ -47,11 +45,8 @@ async function connectDB() {
   try {
     await clientMongo.connect();
     db = clientMongo.db(dbName);
-    console.log(`Conectado a MongoDB Atlas - Usando DB: ${db.databaseName}`);
     await db.command({ ping: 1 });
-    console.log(`Ping a la base de datos "${dbName}" exitoso.`);
   } catch (error) {
-    console.error(`Error conectando a MongoDB o a la base de datos "${dbName}":`, error);
     process.exit(1);
   }
 }
@@ -61,10 +56,144 @@ const mpClient = new MercadoPagoConfig({ accessToken: mpAccessToken });
 const preference = new Preference(mpClient);
 const payment = new Payment(mpClient);
 
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Acceso denegado' });
+
+  jwt.verify(token, jwtSecret, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Token inválido' });
+    req.user = user;
+    next();
+  });
+};
+
+const ensureDispatcherAuthenticated = (req, res, next) => {
+  next();
+};
+
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password, phone, address, city, state, postalCode } = req.body;
+  if (!db) return res.status(500).send();
+  if (!email || !password || !name) return res.status(400).json({ message: 'Faltan datos obligatorios' });
+
+  try {
+    const usersCollection = db.collection('users');
+    const existingUser = await usersCollection.findOne({ email });
+    if (existingUser) return res.status(400).json({ message: 'El correo ya está registrado' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = {
+      name,
+      email,
+      phone: phone || '',
+      address: address || '',
+      city: city || '',
+      state: state || '',
+      postalCode: postalCode || '',
+      password: hashedPassword,
+      spins: 1, 
+      prizes: [],
+      createdAt: new Date()
+    };
+    
+    const result = await usersCollection.insertOne(newUser);
+    const token = jwt.sign({ id: result.insertedId, email }, jwtSecret, { expiresIn: '7d' });
+    
+    res.status(201).json({ token, user: { id: result.insertedId, name, email, spins: 1 } });
+  } catch (error) {
+    res.status(500).json({ message: 'Error en el servidor' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!db) return res.status(500).send();
+
+  try {
+    const usersCollection = db.collection('users');
+    const user = await usersCollection.findOne({ email });
+    if (!user) return res.status(400).json({ message: 'Usuario no encontrado' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: 'Contraseña incorrecta' });
+
+    const token = jwt.sign({ id: user._id, email: user.email }, jwtSecret, { expiresIn: '7d' });
+    res.json({ 
+        token, 
+        user: { 
+            id: user._id, 
+            name: user.name, 
+            email: user.email, 
+            phone: user.phone,
+            spins: user.spins || 0,
+            address: user.address,
+            city: user.city,
+            state: user.state,
+            postalCode: user.postalCode
+        } 
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error en el servidor' });
+  }
+});
+
+app.get('/api/user/data', verifyToken, async (req, res) => {
+  if (!db) return res.status(500).send();
+  try {
+    const userId = new ObjectId(req.user.id);
+    const usersCollection = db.collection('users');
+    const ordersCollection = db.collection('orders');
+
+    const user = await usersCollection.findOne({ _id: userId }, { projection: { password: 0 } });
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    const orders = await ordersCollection.find({ userId: req.user.id }).sort({ createdAt: -1 }).toArray();
+
+    res.json({ 
+      user, 
+      orders,
+      prizes: user.prizes || []
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error obteniendo datos' });
+  }
+});
+
+app.post('/api/user/spin', verifyToken, async (req, res) => {
+  if (!db) return res.status(500).send();
+  try {
+    const userId = new ObjectId(req.user.id);
+    const usersCollection = db.collection('users');
+    
+    const user = await usersCollection.findOne({ _id: userId });
+    if (!user || (user.spins || 0) <= 0) {
+      return res.status(400).json({ message: 'No tienes giros disponibles' });
+    }
+
+    const prizesList = [
+      "5% Descuento", "Envío Gratis", "10% Descuento", "Intenta de nuevo", 
+      "5% Descuento", "Llavero Vitafer", "15% Descuento", "Intenta de nuevo"
+    ];
+    const randomPrize = prizesList[Math.floor(Math.random() * prizesList.length)];
+
+    await usersCollection.updateOne(
+      { _id: userId },
+      { 
+        $inc: { spins: -1 },
+        $push: { prizes: { name: randomPrize, date: new Date() } }
+      }
+    );
+
+    res.json({ prize: randomPrize, remainingSpins: user.spins - 1 });
+  } catch (error) {
+    res.status(500).json({ message: 'Error en la ruleta' });
+  }
+});
+
 app.post('/api/auth/dispatcher/login', async (req, res) => {
   const { username, password } = req.body;
-  if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
-  if (!username || !password) return res.status(400).json({ message: 'Usuario y contraseña requeridos' });
+  if (!db) return res.status(500).json({ message: 'Error DB' });
   try {
     const dispatchersCollection = db.collection('dispatchers');
     const dispatcherUser = await dispatchersCollection.findOne({ username });
@@ -73,211 +202,254 @@ app.post('/api/auth/dispatcher/login', async (req, res) => {
     if (!isMatch) return res.status(401).json({ message: 'Contraseña incorrecta' });
     res.status(200).json({ message: 'Login exitoso', user: { username: dispatcherUser.username, role: dispatcherUser.role } });
   } catch (error) {
-    console.error("Error en login de despachador:", error);
-    res.status(500).json({ message: 'Error interno del servidor' });
+    res.status(500).json({ message: 'Error servidor' });
   }
 });
 
-const ensureDispatcherAuthenticated = (req, res, next) => {
-  console.warn("ADVERTENCIA: Ruta de despachador no está protegida adecuadamente en este momento.");
-  next();
-};
-
-const getOrdersWithEmployeeData = async (statusCriteria, sortCriteria) => {
-  const ordersCollection = db.collection('orders');
-  const aggregationPipeline = [
-    { $match: statusCriteria },
-    { $lookup: { from: "employees", localField: "referralCode", foreignField: "referralCode", as: "referredByEmployeeInfo" } },
-    { $unwind: { path: "$referredByEmployeeInfo", preserveNullAndEmptyArrays: true } },
-    { $project: { customerDetails: 1, items: 1, totalAmount: 1, status: 1, paymentDetails: 1, shippingDetails: 1, createdAt: 1, updatedAt: 1, shippedAt: 1, referralCode: 1, referredByEmployeeName: "$referredByEmployeeInfo.name" } },
-    { $sort: sortCriteria }
-  ];
-  return await ordersCollection.aggregate(aggregationPipeline).toArray();
-};
-
 app.get('/api/dispatcher/orders/pending', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
+  if (!db) return res.status(500).send();
   try {
-    const pendingOrders = await getOrdersWithEmployeeData({ status: 'paid' }, { createdAt: -1 });
+    const ordersCollection = db.collection('orders');
+    const pendingOrders = await ordersCollection.aggregate([
+        { $match: { status: 'paid' } },
+        { $lookup: { from: "employees", localField: "referralCode", foreignField: "referralCode", as: "referredByEmployeeInfo" } },
+        { $unwind: { path: "$referredByEmployeeInfo", preserveNullAndEmptyArrays: true } },
+        { $sort: { createdAt: -1 } }
+    ]).toArray();
     res.status(200).json(pendingOrders);
   } catch (error) {
-    console.error("Error obteniendo órdenes pendientes:", error);
-    res.status(500).json({ message: 'Error interno del servidor al obtener órdenes pendientes' });
+    res.status(500).send();
   }
 });
 
 app.get('/api/dispatcher/orders/shipped', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
+  if (!db) return res.status(500).send();
   try {
-    const shippedOrders = await getOrdersWithEmployeeData({ status: 'shipped' }, { shippedAt: -1 });
+    const ordersCollection = db.collection('orders');
+    const shippedOrders = await ordersCollection.find({ status: 'shipped' }).sort({ shippedAt: -1 }).toArray();
     res.status(200).json(shippedOrders);
   } catch (error) {
-    console.error("Error obteniendo órdenes despachadas:", error);
-    res.status(500).json({ message: 'Error interno del servidor al obtener órdenes despachadas' });
+    res.status(500).send();
   }
 });
 
 app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
+  if (!db) return res.status(500).send();
   const { orderId } = req.params;
   const { trackingNumber } = req.body;
-  if (!ObjectId.isValid(orderId)) return res.status(400).json({ message: 'ID de orden inválido' });
   try {
     const ordersCollection = db.collection('orders');
     const orderObjectId = new ObjectId(orderId);
-    const orderToDispatch = await ordersCollection.findOne({ _id: orderObjectId });
-    if (!orderToDispatch) return res.status(404).json({ message: 'Orden no encontrada' });
-    if (orderToDispatch.status !== 'paid') return res.status(400).json({ message: `La orden no está en estado 'paid'.` });
     const updateData = { status: 'shipped', shippedAt: new Date(), updatedAt: new Date() };
-    if (trackingNumber) { updateData['shippingDetails.trackingNumber'] = trackingNumber; }
-    else { updateData['shippingDetails.trackingNumber'] = null; }
-    const result = await ordersCollection.updateOne({ _id: orderObjectId, status: 'paid' }, { $set: updateData });
-    if (result.modifiedCount === 0) return res.status(404).json({ message: 'Orden no encontrada o ya no está en estado "paid"' });
-    const updatedOrderData = await getOrdersWithEmployeeData({ _id: orderObjectId }, {});
-    res.status(200).json({ message: 'Orden marcada como despachada', order: updatedOrderData[0] || null });
+    if (trackingNumber) updateData['shippingDetails.trackingNumber'] = trackingNumber;
+    
+    await ordersCollection.updateOne({ _id: orderObjectId }, { $set: updateData });
+    res.status(200).json({ message: 'Orden despachada' });
   } catch (error) {
-    console.error(`Error al marcar orden ${orderId} como despachada:`, error);
-    res.status(500).json({ message: 'Error interno del servidor' });
+    res.status(500).send();
   }
 });
 
 app.put('/api/dispatcher/order/:orderId/unship', ensureDispatcherAuthenticated, async (req, res) => {
-    if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
+    if (!db) return res.status(500).send();
     const { orderId } = req.params;
-    if (!ObjectId.isValid(orderId)) return res.status(400).json({ message: 'ID de orden inválido' });
     try {
         const ordersCollection = db.collection('orders');
-        const orderObjectId = new ObjectId(orderId);
-        const orderToUnship = await ordersCollection.findOne({ _id: orderObjectId });
-        if (!orderToUnship) return res.status(404).json({ message: 'Orden no encontrada' });
-        if (orderToUnship.status !== 'shipped') return res.status(400).json({ message: `La orden no está en estado 'shipped'.` });
         const updateData = { status: 'paid', shippedAt: null, 'shippingDetails.trackingNumber': null, updatedAt: new Date() };
-        const result = await ordersCollection.updateOne({ _id: orderObjectId, status: 'shipped' }, { $set: updateData });
-        if (result.modifiedCount === 0) return res.status(404).json({ message: 'Orden no encontrada o ya no está en estado "shipped"' });
-        const updatedOrderData = await getOrdersWithEmployeeData({ _id: orderObjectId }, {});
-        res.status(200).json({ message: 'Despacho de orden revertido', order: updatedOrderData[0] || null });
+        await ordersCollection.updateOne({ _id: new ObjectId(orderId) }, { $set: updateData });
+        res.status(200).json({ message: 'Revertido' });
     } catch (error) {
-        console.error(`Error al revertir despacho de orden ${orderId}:`, error);
-        res.status(500).json({ message: 'Error interno del servidor' });
+        res.status(500).send();
     }
 });
 
-// --- Endpoint para obtener stock de productos ---
-app.post('/api/products/stock', async (req, res) => {
-    if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
-    const { productIds } = req.body;
-
-    if (!Array.isArray(productIds)) {
-        return res.status(400).json({ message: 'Se requiere un array de productIds en el cuerpo' });
-    }
-    if (productIds.length === 0) {
-        return res.status(200).json({});
-    }
-
+app.get('/api/dispatcher/users', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
     try {
-        const inventoryCollection = db.collection('products'); // Usa tu nueva colección de inventario
-        const stockData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
-        
-        const stockMap = {};
-        stockData.forEach(item => {
-            stockMap[item.productId] = item.stock;
-        });
-
-        productIds.forEach(id => {
-            if (!(id in stockMap)) {
-                stockMap[id] = 0; // Asume stock 0 si no está en la colección de inventario
-            }
-        });
-        
-        res.status(200).json(stockMap);
+        const usersCollection = db.collection('users');
+        const users = await usersCollection.find({}, { projection: { password: 0 } }).sort({ createdAt: -1 }).toArray();
+        res.status(200).json(users);
     } catch (error) {
-        console.error("Error obteniendo stock de productos:", error);
-        res.status(500).json({ message: 'Error interno al obtener stock' });
+        res.status(500).send();
     }
 });
 
-// --- Endpoint para que el Despachador actualice el stock ---
-app.put('/api/dispatcher/product/:productId/stock', ensureDispatcherAuthenticated, async (req, res) => {
-    if (!db) return res.status(500).json({ message: 'Error de conexión con la base de datos' });
-    const { productId } = req.params; // Este es el ID de tus constantes (ej. "vitafer-l-500ml")
-    const { newStock } = req.body;
-
-    if (typeof newStock !== 'number' || newStock < 0 || !Number.isInteger(newStock)) {
-        return res.status(400).json({ message: 'La cantidad de stock debe ser un número entero no negativo.' });
-    }
-    if (!productId || typeof productId !== 'string') {
-        return res.status(400).json({ message: 'ID de producto inválido o requerido' });
-    }
+app.post('/api/dispatcher/users', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { name, email, password, phone, spins } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Datos incompletos' });
     
     try {
-        const inventoryCollection = db.collection('products'); // Usa tu nueva colección de inventario
-        const result = await inventoryCollection.updateOne(
-            { productId: productId },
-            { $set: { stock: newStock }, $setOnInsert: { productId: productId } }, // Si es nuevo, guarda productId y stock
-            { upsert: true } // Crea el documento si no existe
-        );
+        const usersCollection = db.collection('users');
+        const existing = await usersCollection.findOne({ email });
+        if (existing) return res.status(400).json({ message: 'Email ya registrado' });
 
-        if (result.upsertedCount > 0 || result.modifiedCount > 0 || result.matchedCount > 0 ) {
-             const updatedProductStock = await inventoryCollection.findOne({productId: productId});
-             res.status(200).json({ message: 'Stock actualizado exitosamente', product: updatedProductStock });
-        } else {
-             res.status(404).json({ message: 'No se pudo actualizar el stock (producto no encontrado y upsert no funcionó como esperado).' });
-        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = {
+            name, email, phone, password: hashedPassword,
+            spins: parseInt(spins) || 0,
+            prizes: [],
+            createdAt: new Date()
+        };
+        await usersCollection.insertOne(newUser);
+        res.status(201).json({ message: 'Usuario creado' });
     } catch (error) {
-        console.error(`Error al actualizar stock para producto ${productId}:`, error);
-        res.status(500).json({ message: 'Error interno del servidor al actualizar stock' });
+        res.status(500).send();
     }
 });
 
-// --- Endpoint de Crear Preferencia MODIFICADO para usar la nueva colección de stock ---
-app.post('/api/create-preference', async (req, res) => {
-  const orderData = req.body; // items deben tener 'id' (tu productId de constantes) y 'quantity' deseada
-  const currentFrontendUrl = req.get('origin');
+app.put('/api/dispatcher/user/:userId', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    const { spins } = req.body;
+    try {
+        const usersCollection = db.collection('users');
+        await usersCollection.updateOne({ _id: new ObjectId(userId) }, { $set: { spins: parseInt(spins) } });
+        res.status(200).json({ message: 'Usuario actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
 
-  if (!db) return res.status(500).json({ message: 'Error interno: Sin conexión a base de datos' });
-  if (!orderData || !orderData.customerDetails || !orderData.items || orderData.items.length === 0) {
-      return res.status(400).json({ message: 'Datos de la orden inválidos o incompletos' });
-  }
+app.delete('/api/dispatcher/user/:userId', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    try {
+        const usersCollection = db.collection('users');
+        await usersCollection.deleteOne({ _id: new ObjectId(userId) });
+        res.status(200).json({ message: 'Usuario eliminado' });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.get('/api/dispatcher/user/:userId/details', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    try {
+        const usersCollection = db.collection('users');
+        const ordersCollection = db.collection('orders');
+        
+        const user = await usersCollection.findOne({ _id: new ObjectId(userId) }, { projection: { password: 0 } });
+        if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+        const orders = await ordersCollection.find({ userId: userId }).sort({ createdAt: -1 }).toArray();
+        
+        res.status(200).json({ user, orders });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.post('/api/products/data', async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { productIds } = req.body;
+    if (!productIds || productIds.length === 0) return res.status(200).json({});
+    try {
+        const inventoryCollection = db.collection('products');
+        const productData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
+        const dataMap = {};
+        productData.forEach(item => { 
+            dataMap[item.productId] = { 
+                stock: item.stock, 
+                price: item.price 
+            }; 
+        });
+        res.status(200).json(dataMap);
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.post('/api/products/stock', async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { productIds } = req.body;
+    if (!productIds || productIds.length === 0) return res.status(200).json({});
+    try {
+        const inventoryCollection = db.collection('products');
+        const stockData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
+        const stockMap = {};
+        stockData.forEach(item => { stockMap[item.productId] = item.stock; });
+        productIds.forEach(id => { if (!(id in stockMap)) stockMap[id] = 0; });
+        res.status(200).json(stockMap);
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.put('/api/dispatcher/product/:productId/update', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { productId } = req.params;
+    const { newStock, newPrice } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        const updateFields = {};
+        if (newStock !== undefined) updateFields.stock = newStock;
+        if (newPrice !== undefined) updateFields.price = newPrice;
+        
+        await inventoryCollection.updateOne(
+            { productId: productId },
+            { $set: updateFields, $setOnInsert: { productId: productId } },
+            { upsert: true }
+        );
+        res.status(200).json({ message: 'Producto actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.put('/api/dispatcher/product/:productId/stock', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { productId } = req.params;
+    const { newStock } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        await inventoryCollection.updateOne(
+            { productId: productId },
+            { $set: { stock: newStock }, $setOnInsert: { productId: productId } },
+            { upsert: true }
+        );
+        res.status(200).json({ message: 'Stock actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+app.post('/api/create-preference', async (req, res) => {
+  const orderData = req.body;
+  const currentFrontendUrl = req.get('origin');
+  if (!db) return res.status(500).send();
 
   const ordersCollection = db.collection('orders');
-  const inventoryCollection = db.collection('products'); // Tu nueva colección de inventario
-  const session = clientMongo.startSession(); // Inicia una sesión para transacciones
+  const inventoryCollection = db.collection('products');
+  const session = clientMongo.startSession();
   
   let createdOrderId;
-  let itemsForRollback = []; // Para guardar qué items se les descontó stock
+  let itemsForRollback = [];
 
   try {
     await session.withTransaction(async (currentSession) => {
-      // 1. Verificar stock para todos los items
       for (const item of orderData.items) {
-        if (!item.id || typeof item.id !== 'string') { // El frontend envía 'id' que es tu 'productId'
-          throw new Error(`Item del carrito "${item.name}" no tiene un ID de producto válido.`);
-        }
         const productInInventory = await inventoryCollection.findOne({ productId: item.id }, { session: currentSession });
         if (!productInInventory || productInInventory.stock < item.quantity) {
-          throw new Error(`Stock insuficiente para "${item.name}". Disponible: ${productInInventory?.stock || 0}, Solicitado: ${item.quantity}.`);
+          throw new Error(`Stock insuficiente para ${item.name}`);
         }
       }
 
-      // 2. Si hay stock, descontar de la colección 'products'
       for (const item of orderData.items) {
-        const updateResult = await inventoryCollection.updateOne(
-          { productId: item.id, stock: { $gte: item.quantity } }, // Condición para evitar race conditions
+        await inventoryCollection.updateOne(
+          { productId: item.id },
           { $inc: { stock: -item.quantity } },
           { session: currentSession }
         );
-        if (updateResult.modifiedCount === 0) { // Si no se modificó, el stock cambió o no fue suficiente
-            throw new Error(`No se pudo actualizar el stock para "${item.name}". Pudo agotarse o hubo un conflicto. Intenta de nuevo.`);
-        }
-        itemsForRollback.push({ productId: item.id, quantity: item.quantity }); // Guarda para posible rollback
-        console.log(`Stock descontado para ${item.id}: ${item.quantity} unidades.`);
+        itemsForRollback.push({ productId: item.id, quantity: item.quantity });
       }
 
-      // 3. Crear la orden en la colección 'orders'
       const newOrder = {
+          userId: orderData.userId || null,
           customerDetails: orderData.customerDetails,
           items: orderData.items.map(i => ({
-              productId: i.id, // Guarda el productId que viene del frontend
+              productId: i.id,
               name: i.name,
               presentation: i.presentation,
               quantity: i.quantity,
@@ -285,194 +457,123 @@ app.post('/api/create-preference', async (req, res) => {
               totalItemPrice: i.quantity * (parseFloat(i.unit_price) || 0)
           })),
           totalAmount: parseFloat(orderData.totalAmount) || 0,
-          status: 'pending_payment', // Se crea como 'pending_payment' ya que el stock se descontó
-          paymentDetails: { method: 'mercadopago', mercadoPagoPreferenceId: null, mercadoPagoPaymentId: null, paymentStatus: 'pending', paidAt: null },
-          shippingDetails: { method: "Por definir", cost: 0, trackingNumber: null },
+          status: 'pending_payment',
+          paymentDetails: { method: 'mercadopago', paymentStatus: 'pending' },
+          shippingDetails: { method: "Por definir", trackingNumber: null },
           createdAt: new Date(),
           updatedAt: new Date(),
           referralCode: orderData.referralCode || null
       };
-      if (isNaN(newOrder.totalAmount)) throw new Error('El monto total de la orden es inválido.');
-      if (newOrder.items.some(item => isNaN(item.unitPrice))) throw new Error('Uno o más precios unitarios son inválidos.');
 
       const savedOrder = await ordersCollection.insertOne(newOrder, { session: currentSession });
       createdOrderId = savedOrder.insertedId;
-      console.log(`Orden ${createdOrderId} creada (Referido: ${newOrder.referralCode || 'Ninguno'}) con estado 'pending_payment'.`);
-    }); // Fin de session.withTransaction
+    });
 
-    // Si la transacción de MongoDB fue exitosa, createdOrderId tendrá un valor
-    // Procedemos a crear la preferencia de MercadoPago
     const effectiveFrontendUrl = allowedOrigins.includes(currentFrontendUrl) ? currentFrontendUrl : allowedOrigins[0];
     const preferenceItems = orderData.items.map(item => ({
-        id: item.id, // Este es tu productId
-        title: item.name.substring(0, 250),
-        description: (item.presentation || '').substring(0, 250),
+        id: item.id,
+        title: item.name,
         quantity: item.quantity,
-        unit_price: parseFloat(item.unit_price) || 0,
+        unit_price: parseFloat(item.unit_price),
         currency_id: 'MXN',
     }));
 
     const preferenceData = {
        body: {
          items: preferenceItems,
-         payer: { name: orderData.customerDetails.name, email: orderData.customerDetails.email, phone: { number: orderData.customerDetails.phone }, },
+         payer: { name: orderData.customerDetails.name, email: orderData.customerDetails.email },
          back_urls: { success: `${effectiveFrontendUrl}/payment-success?order_id=${createdOrderId.toString()}`, failure: `${effectiveFrontendUrl}/payment-failure?order_id=${createdOrderId.toString()}`, pending: `${effectiveFrontendUrl}/payment-pending?order_id=${createdOrderId.toString()}`, },
          notification_url: `${backendUrl}/api/mercadopago-webhook?source_news=webhooks&orderId=${createdOrderId.toString()}`,
          external_reference: createdOrderId.toString(),
        }
     };
-    if (process.env.AUTO_RETURN_MP === 'approved') { preferenceData.body.auto_return = 'approved'; }
 
     const mpPreference = await preference.create(preferenceData);
-    console.log(`Preferencia MP ${mpPreference.id} creada para orden ${createdOrderId}`);
-    
-    await ordersCollection.updateOne( // Actualiza la orden con el preferenceId de MP
-        { _id: createdOrderId },
-        { $set: { 'paymentDetails.mercadoPagoPreferenceId': mpPreference.id, updatedAt: new Date() } }
-    );
+    await ordersCollection.updateOne({ _id: createdOrderId }, { $set: { 'paymentDetails.mercadoPagoPreferenceId': mpPreference.id } });
     res.status(201).json({ mercadoPagoUrl: mpPreference.init_point });
 
-  } catch (error) { // Captura errores de la transacción de MongoDB o de la creación de preferencia MP
-    console.error('Error en /api/create-preference:', error.message || error);
-    
-    // Si el error ocurrió DESPUÉS de descontar stock (itemsForRollback tiene datos)
-    // Y el error NO es un error de stock (ya que eso se maneja dentro de la transacción)
-    // Esto podría ser un error al crear la preferencia de MP o al actualizar la orden con el preferenceId
+  } catch (error) {
     if (itemsForRollback.length > 0 && !error.message.toLowerCase().includes('stock')) {
-        console.warn("Error DESPUÉS de transacción de stock. Intentando revertir descuento de stock...");
         for (const { productId, quantity } of itemsForRollback) {
-            try {
-                await inventoryCollection.updateOne(
-                    { productId: productId },
-                    { $inc: { stock: quantity } } // Devuelve el stock
-                );
-                console.log(`Stock (rollback) revertido para ${productId}: ${quantity} unidades.`);
-            } catch (revertError) {
-                console.error(`FALLO CRÍTICO (ROLLBACK): No se pudo revertir el stock para ${productId}. Revisar manualmente. Error:`, revertError);
-            }
+            await inventoryCollection.updateOne({ productId: productId }, { $inc: { stock: quantity } });
         }
     }
-    res.status(error.message.includes("Stock insuficiente") || error.message.includes("No se pudo actualizar el stock") ? 400 : 500)
-       .json({ message: error.message || 'Error interno del servidor al crear la preferencia', errorType: error.message.includes("Stock") ? 'STOCK_ERROR' : 'SERVER_ERROR' });
+    res.status(500).json({ message: error.message });
   } finally {
-    await session.endSession(); // Siempre cierra la sesión de MongoDB
+    await session.endSession();
   }
 });
 
-// --- Webhook MODIFICADO para revertir stock en pagos fallidos ---
 app.post('/api/mercadopago-webhook', async (req, res) => {
-  console.log("Webhook recibido:", req.query); console.log("Webhook body:", req.body);
   const { query, body } = req;
   const topic = query.topic || query.type;
 
   if (topic === 'payment' || body?.type === 'payment') {
     const paymentId = body?.data?.id;
-    console.log(`Webhook: Notificación de pago recibida. Payment ID: ${paymentId}.`);
     if (paymentId && db) {
-      const session = clientMongo.startSession(); // Usa sesión para las actualizaciones
+      const session = clientMongo.startSession();
       try {
         await session.withTransaction(async (currentSession) => {
             const paymentInfoResult = await payment.get({ id: paymentId.toString() });
-            console.log("Respuesta de MP al consultar pago:", JSON.stringify(paymentInfoResult, null, 2));
-            
-            const paymentData = paymentInfoResult;
-            const paymentStatusFromMP = paymentData?.status;
-            const externalReference = paymentData?.external_reference; 
-
-            if (!externalReference) {
-                console.error(`Error webhook: external_reference no encontrado en pago ${paymentId}.`);
-                throw new Error(`external_reference faltante para pago ${paymentId}`); // Aborta la transacción
-            }
-            const orderObjectId = new ObjectId(externalReference);
+            const paymentStatusFromMP = paymentInfoResult?.status;
+            const externalReference = paymentInfoResult?.external_reference; 
             
             const ordersCollection = db.collection('orders');
             const inventoryCollection = db.collection('products');
+            const usersCollection = db.collection('users');
+
+            const orderObjectId = new ObjectId(externalReference);
             const order = await ordersCollection.findOne({_id: orderObjectId}, { session: currentSession });
 
-            if (!order) {
-                console.error(`Webhook: Orden ${orderObjectId} no encontrada en DB para pago ${paymentId}.`);
-                throw new Error(`Orden ${orderObjectId} no encontrada para pago ${paymentId}`); // Aborta la transacción
-            }
-            console.log(`Procesando webhook para pago ${paymentId}, Orden ${orderObjectId}. Estado actual DB: ${order.status}`);
+            if (order) {
+                let newOrderStatusInDB;
+                let paymentDetailsUpdate = { 
+                    'paymentDetails.mercadoPagoPaymentId': paymentId.toString(), 
+                    'paymentDetails.paymentStatus': paymentStatusFromMP,
+                    updatedAt: new Date() 
+                };
 
-            let newOrderStatusInDB;
-            let paymentDetailsUpdate = { 
-                'paymentDetails.mercadoPagoPaymentId': paymentId.toString(), 
-                'paymentDetails.paymentStatus': paymentStatusFromMP,
-                updatedAt: new Date() 
-            };
-
-            if (paymentStatusFromMP === 'approved') { 
-                newOrderStatusInDB = 'paid'; 
-                paymentDetailsUpdate['paymentDetails.paidAt'] = new Date(); 
-                // El stock ya se descontó al crear la preferencia. Aquí solo confirmamos.
-            } else if (['rejected', 'cancelled', 'refunded', 'charged_back'].includes(paymentStatusFromMP)) { 
-                newOrderStatusInDB = 'failed';
-                // Revertir stock SOLO si la orden estaba en 'pending_payment'
-                // (lo que significa que el stock se descontó pero el pago final falló)
-                if (order.status === 'pending_payment') {
-                    console.warn(`Pago ${paymentId} para orden ${orderObjectId} es ${paymentStatusFromMP}. Revertiendo stock...`);
-                    for (const item of order.items) {
-                        // item.productId debe existir en los items de la orden
-                        if (!item.productId) {
-                             console.error(`Falta productId en item de orden ${orderObjectId} para revertir stock.`);
-                             continue; // Salta este item pero continúa con otros si es posible
-                        }
-                        await inventoryCollection.updateOne(
-                            { productId: item.productId },
-                            { $inc: { stock: item.quantity } },
+                if (paymentStatusFromMP === 'approved') { 
+                    newOrderStatusInDB = 'paid'; 
+                    paymentDetailsUpdate['paymentDetails.paidAt'] = new Date();
+                    if (order.status !== 'paid' && order.userId) {
+                        await usersCollection.updateOne(
+                            { _id: new ObjectId(order.userId) },
+                            { $inc: { spins: 1 } },
                             { session: currentSession }
                         );
-                        console.log(`Stock (webhook) revertido para ${item.productId}: ${item.quantity} unidades.`);
                     }
-                } else {
-                    console.log(`Orden ${orderObjectId} con estado ${order.status}. No se revierte stock para pago ${paymentStatusFromMP}.`);
+                } else if (['rejected', 'cancelled', 'refunded', 'charged_back'].includes(paymentStatusFromMP)) { 
+                    newOrderStatusInDB = 'failed';
+                    if (order.status === 'pending_payment') {
+                        for (const item of order.items) {
+                            await inventoryCollection.updateOne(
+                                { productId: item.productId },
+                                { $inc: { stock: item.quantity } },
+                                { session: currentSession }
+                            );
+                        }
+                    }
+                } else if (paymentStatusFromMP === 'in_process' || paymentStatusFromMP === 'pending') { 
+                    newOrderStatusInDB = 'pending_payment'; 
                 }
-            } else if (paymentStatusFromMP === 'in_process' || paymentStatusFromMP === 'pending') { 
-                newOrderStatusInDB = 'pending_payment'; 
-            } else { 
-                console.log(`Estado de pago MP '${paymentStatusFromMP}' no manejado para cambio de estado principal de orden ${orderObjectId}. Solo actualizando detalles de pago.`); 
-                await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate }, {session: currentSession}); 
-                return;
-            }
-            
-            if (newOrderStatusInDB && (order.status !== newOrderStatusInDB || order.paymentDetails.paymentStatus !== paymentStatusFromMP)) {
-               paymentDetailsUpdate.status = newOrderStatusInDB;
-               const updateResult = await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate }, {session: currentSession});
-               if (updateResult.modifiedCount > 0) { 
-                   console.log(`Orden ${orderObjectId} actualizada a ${newOrderStatusInDB}.`); 
-                   if (newOrderStatusInDB === 'paid' && order.customerDetails?.email) {
-                        const emailOrderDetails = {
-                            id: order._id.toString(), customerName: order.customerDetails.name,
-                            items: order.items, totalAmount: order.totalAmount,
-                            customerDetails: order.customerDetails,
-                            formatPrice: (value) => typeof value === 'number' ? value.toLocaleString('es-MX', {style:'currency', currency:'MXN', minimumFractionDigits:0}) : '$0'
-                        };
 
-                        console.log(`SIMULACIÓN: Enviando email de confirmación para orden ${orderObjectId}`);
-                   }
-               } else { 
-                   console.log(`Orden ${orderObjectId} no actualizada por webhook (quizás ya tenía el estado correcto).`); 
-               }
-            } else {
-                console.log(`Orden ${orderObjectId} ya tiene el estado ${newOrderStatusInDB} y paymentStatus ${paymentStatusFromMP}.`);
+                if (newOrderStatusInDB) {
+                   paymentDetailsUpdate.status = newOrderStatusInDB;
+                   await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate }, {session: currentSession});
+                }
             }
         });
       } catch (err) { 
-          console.error(`Error CRÍTICO procesando webhook para pago ${paymentId} con transacción:`, err.cause || err.message || err);
+          console.error(err);
       } finally {
           await session.endSession();
       }
-    } else { console.log("Webhook ignorado: Faltan paymentId o conexión a DB."); }
-  } else { console.log(`Webhook ignorado: Tópico no manejado '${topic}' o tipo no es 'payment'`); }
+    }
+  }
   res.sendStatus(200);
 });
 
-app.use((err, req, res, next) => {
-    console.error("Error no manejado:", err.stack);
-    res.status(500).json({ message: 'Error interno del servidor' });
-});
-
 app.listen(port, () => {
-  console.log(`Backend escuchando en ${backendUrl} (Puerto: ${port})`);
+  console.log(`Server running port ${port}`);
 });
