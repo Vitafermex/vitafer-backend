@@ -32,7 +32,7 @@ app.use(cors({
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(null, true);
+      callback(null, true); 
     }
   },
   credentials: true
@@ -60,7 +60,6 @@ const mpClient = new MercadoPagoConfig({ accessToken: mpAccessToken });
 const preference = new Preference(mpClient);
 const payment = new Payment(mpClient);
 
-// --- Middlewares ---
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -77,7 +76,6 @@ const ensureDispatcherAuthenticated = (req, res, next) => {
   next();
 };
 
-// --- Configuración Nodemailer ---
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
@@ -87,8 +85,6 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS,
   },
 });
-
-// --- Rutas de Autenticación (Usuarios) ---
 
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, password, phone, address, city, state, postalCode } = req.body;
@@ -110,14 +106,15 @@ app.post('/api/auth/register', async (req, res) => {
       state: state || '',
       postalCode: postalCode || '',
       password: hashedPassword,
-      spins: 1,
+      spins: 1, 
+      progressAmount: 0, // Inicializamos saldo en 0
       prizes: [],
       createdAt: new Date()
     };
-
+    
     const result = await usersCollection.insertOne(newUser);
     const token = jwt.sign({ id: result.insertedId, email }, jwtSecret, { expiresIn: '7d' });
-
+    
     res.status(201).json({ token, user: { id: result.insertedId, name, email, spins: 1 } });
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor' });
@@ -137,26 +134,25 @@ app.post('/api/auth/login', async (req, res) => {
     if (!isMatch) return res.status(400).json({ message: 'Contraseña incorrecta' });
 
     const token = jwt.sign({ id: user._id, email: user.email }, jwtSecret, { expiresIn: '7d' });
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        spins: user.spins || 0,
-        address: user.address,
-        city: user.city,
-        state: user.state,
-        postalCode: user.postalCode
-      }
+    res.json({ 
+        token, 
+        user: { 
+            id: user._id, 
+            name: user.name, 
+            email: user.email, 
+            phone: user.phone,
+            spins: user.spins || 0,
+            progressAmount: user.progressAmount || 0, // Enviamos el saldo al frontend
+            address: user.address,
+            city: user.city,
+            state: user.state,
+            postalCode: user.postalCode
+        } 
     });
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor' });
   }
 });
-
-// --- Recuperación de Contraseña ---
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body;
@@ -168,7 +164,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
 
     const resetToken = crypto.randomInt(100000, 999999).toString();
-    const resetTokenExpire = Date.now() + 3600000; // 1 hora
+    const resetTokenExpire = Date.now() + 3600000; 
 
     await usersCollection.updateOne(
       { email },
@@ -222,8 +218,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
-// --- Rutas de Usuario (Datos y Ruleta) ---
-
 app.get('/api/user/data', verifyToken, async (req, res) => {
   if (!db) return res.status(500).send();
   try {
@@ -236,8 +230,8 @@ app.get('/api/user/data', verifyToken, async (req, res) => {
 
     const orders = await ordersCollection.find({ userId: req.user.id }).sort({ createdAt: -1 }).toArray();
 
-    res.json({
-      user,
+    res.json({ 
+      user: { ...user, progressAmount: user.progressAmount || 0 },
       orders,
       prizes: user.prizes || []
     });
@@ -257,23 +251,17 @@ app.post('/api/user/spin', verifyToken, async (req, res) => {
       return res.status(400).json({ message: 'No tienes giros disponibles' });
     }
 
-    // --- LÓGICA DE PROBABILIDADES ACTUALIZADA ---
-    // 0 - 10:  Vacía (10%)
-    // 10 - 70: 1 Sachet (60%)
-    // 70 - 90: 2 Sachets (20%)
-    // 90 - 100: 3 Sachets (10%)
-
     const rand = Math.random() * 100;
     let prizeName = "Sigue intentando";
     let isWin = false;
 
-    if (rand < 10) { 
+    if (rand < 25) { 
         prizeName = "Casilla Vacia"; 
         isWin = false;
-    } else if (rand < 70) { 
+    } else if (rand < 62.5) { 
         prizeName = "1 Sachet Vitafer"; 
         isWin = true;
-    } else if (rand < 90) { 
+    } else if (rand < 87.5) { 
         prizeName = "2 Sachets Vitafer"; 
         isWin = true;
     } else { 
@@ -283,7 +271,14 @@ app.post('/api/user/spin', verifyToken, async (req, res) => {
 
     const updateQuery = { $inc: { spins: -1 } };
     if (isWin) {
-        updateQuery.$push = { prizes: { name: prizeName, date: new Date(), status: 'pending_delivery' } };
+        updateQuery.$push = { 
+            prizes: { 
+                _id: new ObjectId(), 
+                name: prizeName, 
+                date: new Date(), 
+                status: 'pending_delivery'
+            } 
+        };
     }
 
     await usersCollection.updateOne({ _id: userId }, updateQuery);
@@ -298,7 +293,23 @@ app.post('/api/user/spin', verifyToken, async (req, res) => {
   }
 });
 
-// --- Rutas de Despachador / Admin ---
+app.put('/api/dispatcher/user/:userId/prize/:prizeId/dispatch', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { userId, prizeId } = req.params;
+    try {
+        const usersCollection = db.collection('users');
+        const result = await usersCollection.updateOne(
+            { _id: new ObjectId(userId), "prizes._id": new ObjectId(prizeId) },
+            { $set: { "prizes.$.status": "shipped", "prizes.$.shippedAt": new Date() } }
+        );
+        if (result.modifiedCount === 0) return res.status(404).json({ message: 'No modificado' });
+        res.status(200).json({ message: 'Premio despachado' });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
+
+// --- Gestión de Dispatcher ---
 
 app.post('/api/auth/dispatcher/login', async (req, res) => {
   const { username, password } = req.body;
@@ -320,10 +331,10 @@ app.get('/api/dispatcher/orders/pending', ensureDispatcherAuthenticated, async (
   try {
     const ordersCollection = db.collection('orders');
     const pendingOrders = await ordersCollection.aggregate([
-      { $match: { status: 'paid' } },
-      { $lookup: { from: "employees", localField: "referralCode", foreignField: "referralCode", as: "referredByEmployeeInfo" } },
-      { $unwind: { path: "$referredByEmployeeInfo", preserveNullAndEmptyArrays: true } },
-      { $sort: { createdAt: -1 } }
+        { $match: { status: 'paid' } },
+        { $lookup: { from: "employees", localField: "referralCode", foreignField: "referralCode", as: "referredByEmployeeInfo" } },
+        { $unwind: { path: "$referredByEmployeeInfo", preserveNullAndEmptyArrays: true } },
+        { $sort: { createdAt: -1 } }
     ]).toArray();
     res.status(200).json(pendingOrders);
   } catch (error) {
@@ -356,7 +367,7 @@ app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated
     const orderObjectId = new ObjectId(orderId);
     const updateData = { status: 'shipped', shippedAt: new Date(), updatedAt: new Date() };
     if (trackingNumber) updateData['shippingDetails.trackingNumber'] = trackingNumber;
-
+    
     await ordersCollection.updateOne({ _id: orderObjectId }, { $set: updateData });
     res.status(200).json({ message: 'Orden despachada' });
   } catch (error) {
@@ -365,175 +376,204 @@ app.put('/api/dispatcher/order/:orderId/dispatch', ensureDispatcherAuthenticated
 });
 
 app.put('/api/dispatcher/order/:orderId/unship', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { orderId } = req.params;
-  try {
-    const ordersCollection = db.collection('orders');
-    const updateData = { status: 'paid', shippedAt: null, 'shippingDetails.trackingNumber': null, updatedAt: new Date() };
-    await ordersCollection.updateOne({ _id: new ObjectId(orderId) }, { $set: updateData });
-    res.status(200).json({ message: 'Revertido' });
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { orderId } = req.params;
+    try {
+        const ordersCollection = db.collection('orders');
+        const updateData = { status: 'paid', shippedAt: null, 'shippingDetails.trackingNumber': null, updatedAt: new Date() };
+        await ordersCollection.updateOne({ _id: new ObjectId(orderId) }, { $set: updateData });
+        res.status(200).json({ message: 'Revertido' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
-// --- Gestión de Usuarios desde Admin ---
-
 app.get('/api/dispatcher/users', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  try {
-    const usersCollection = db.collection('users');
-    const users = await usersCollection.find({}, { projection: { password: 0 } }).sort({ createdAt: -1 }).toArray();
-    res.status(200).json(users);
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    try {
+        const usersCollection = db.collection('users');
+        const users = await usersCollection.find({}, { projection: { password: 0 } }).sort({ createdAt: -1 }).toArray();
+        res.status(200).json(users);
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.post('/api/dispatcher/users', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { name, email, password, phone, spins } = req.body;
-  if (!email || !password) return res.status(400).json({ message: 'Datos incompletos' });
+    if (!db) return res.status(500).send();
+    const { name, email, password, phone, spins } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Datos incompletos' });
+    
+    try {
+        const usersCollection = db.collection('users');
+        const existing = await usersCollection.findOne({ email });
+        if (existing) return res.status(400).json({ message: 'Email ya registrado' });
 
-  try {
-    const usersCollection = db.collection('users');
-    const existing = await usersCollection.findOne({ email });
-    if (existing) return res.status(400).json({ message: 'Email ya registrado' });
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = {
-      name, email, phone, password: hashedPassword,
-      spins: parseInt(spins) || 0,
-      prizes: [],
-      createdAt: new Date()
-    };
-    await usersCollection.insertOne(newUser);
-    res.status(201).json({ message: 'Usuario creado' });
-  } catch (error) {
-    res.status(500).send();
-  }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = {
+            name, email, phone, password: hashedPassword,
+            spins: parseInt(spins) || 0,
+            progressAmount: 0,
+            prizes: [],
+            createdAt: new Date()
+        };
+        await usersCollection.insertOne(newUser);
+        res.status(201).json({ message: 'Usuario creado' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.put('/api/dispatcher/user/:userId', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { userId } = req.params;
-  const { spins } = req.body;
-  try {
-    const usersCollection = db.collection('users');
-    await usersCollection.updateOne({ _id: new ObjectId(userId) }, { $set: { spins: parseInt(spins) } });
-    res.status(200).json({ message: 'Usuario actualizado' });
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    const { spins } = req.body;
+    try {
+        const usersCollection = db.collection('users');
+        await usersCollection.updateOne({ _id: new ObjectId(userId) }, { $set: { spins: parseInt(spins) } });
+        res.status(200).json({ message: 'Usuario actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.delete('/api/dispatcher/user/:userId', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { userId } = req.params;
-  try {
-    const usersCollection = db.collection('users');
-    await usersCollection.deleteOne({ _id: new ObjectId(userId) });
-    res.status(200).json({ message: 'Usuario eliminado' });
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    try {
+        const usersCollection = db.collection('users');
+        await usersCollection.deleteOne({ _id: new ObjectId(userId) });
+        res.status(200).json({ message: 'Usuario eliminado' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.get('/api/dispatcher/user/:userId/details', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { userId } = req.params;
-  try {
-    const usersCollection = db.collection('users');
-    const ordersCollection = db.collection('orders');
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    try {
+        const usersCollection = db.collection('users');
+        const ordersCollection = db.collection('orders');
+        
+        const user = await usersCollection.findOne({ _id: new ObjectId(userId) }, { projection: { password: 0 } });
+        if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
 
-    const user = await usersCollection.findOne({ _id: new ObjectId(userId) }, { projection: { password: 0 } });
-    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
-
-    const orders = await ordersCollection.find({ userId: userId }).sort({ createdAt: -1 }).toArray();
-
-    res.status(200).json({ user, orders });
-  } catch (error) {
-    res.status(500).send();
-  }
+        const orders = await ordersCollection.find({ userId: userId }).sort({ createdAt: -1 }).toArray();
+        
+        res.status(200).json({ user, orders });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
-// --- Gestión de Productos y Stock ---
+app.post('/api/dispatcher/user/:userId/manual-purchase', ensureDispatcherAuthenticated, async (req, res) => {
+    if (!db) return res.status(500).send();
+    const { userId } = req.params;
+    const { amount } = req.body;
+    const purchaseAmount = parseFloat(amount);
+
+    if (isNaN(purchaseAmount) || purchaseAmount <= 0) {
+        return res.status(400).json({ message: 'Monto inválido' });
+    }
+
+    try {
+        const usersCollection = db.collection('users');
+        const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+        
+        if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+        const SPIN_THRESHOLD = 500;
+        let currentProgress = user.progressAmount || 0;
+        let totalPool = currentProgress + purchaseAmount;
+        
+        const newSpins = Math.floor(totalPool / SPIN_THRESHOLD);
+        const newProgress = totalPool % SPIN_THRESHOLD;
+
+        await usersCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { 
+                $inc: { spins: newSpins },
+                $set: { progressAmount: newProgress }
+            }
+        );
+
+        res.status(200).json({ 
+            message: 'Compra registrada', 
+            addedSpins: newSpins, 
+            newProgress 
+        });
+    } catch (error) {
+        res.status(500).send();
+    }
+});
 
 app.post('/api/products/data', async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { productIds } = req.body;
-  if (!productIds || productIds.length === 0) return res.status(200).json({});
-  try {
-    const inventoryCollection = db.collection('products');
-    const productData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
-    const dataMap = {};
-    productData.forEach(item => {
-      dataMap[item.productId] = {
-        stock: item.stock,
-        price: item.price
-      };
-    });
-    res.status(200).json(dataMap);
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { productIds } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        const productData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
+        const dataMap = {};
+        productData.forEach(item => { dataMap[item.productId] = { stock: item.stock, price: item.price }; });
+        res.status(200).json(dataMap);
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.post('/api/products/stock', async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { productIds } = req.body;
-  if (!productIds || productIds.length === 0) return res.status(200).json({});
-  try {
-    const inventoryCollection = db.collection('products');
-    const stockData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
-    const stockMap = {};
-    stockData.forEach(item => { stockMap[item.productId] = item.stock; });
-    productIds.forEach(id => { if (!(id in stockMap)) stockMap[id] = 0; });
-    res.status(200).json(stockMap);
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { productIds } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        const stockData = await inventoryCollection.find({ productId: { $in: productIds } }).toArray();
+        const stockMap = {};
+        stockData.forEach(item => { stockMap[item.productId] = item.stock; });
+        productIds.forEach(id => { if (!(id in stockMap)) stockMap[id] = 0; });
+        res.status(200).json(stockMap);
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.put('/api/dispatcher/product/:productId/update', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { productId } = req.params;
-  const { newStock, newPrice } = req.body;
-  try {
-    const inventoryCollection = db.collection('products');
-    const updateFields = {};
-    if (newStock !== undefined) updateFields.stock = newStock;
-    if (newPrice !== undefined) updateFields.price = newPrice;
-
-    await inventoryCollection.updateOne(
-      { productId: productId },
-      { $set: updateFields, $setOnInsert: { productId: productId } },
-      { upsert: true }
-    );
-    res.status(200).json({ message: 'Producto actualizado' });
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { productId } = req.params;
+    const { newStock, newPrice } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        const updateFields = {};
+        if (newStock !== undefined) updateFields.stock = newStock;
+        if (newPrice !== undefined) updateFields.price = newPrice;
+        
+        await inventoryCollection.updateOne(
+            { productId: productId },
+            { $set: updateFields, $setOnInsert: { productId: productId } },
+            { upsert: true }
+        );
+        res.status(200).json({ message: 'Producto actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
 
 app.put('/api/dispatcher/product/:productId/stock', ensureDispatcherAuthenticated, async (req, res) => {
-  if (!db) return res.status(500).send();
-  const { productId } = req.params;
-  const { newStock } = req.body;
-  try {
-    const inventoryCollection = db.collection('products');
-    await inventoryCollection.updateOne(
-      { productId: productId },
-      { $set: { stock: newStock }, $setOnInsert: { productId: productId } },
-      { upsert: true }
-    );
-    res.status(200).json({ message: 'Stock actualizado' });
-  } catch (error) {
-    res.status(500).send();
-  }
+    if (!db) return res.status(500).send();
+    const { productId } = req.params;
+    const { newStock } = req.body;
+    try {
+        const inventoryCollection = db.collection('products');
+        await inventoryCollection.updateOne(
+            { productId: productId },
+            { $set: { stock: newStock }, $setOnInsert: { productId: productId } },
+            { upsert: true }
+        );
+        res.status(200).json({ message: 'Stock actualizado' });
+    } catch (error) {
+        res.status(500).send();
+    }
 });
-
-// --- Procesamiento de Pagos (Mercado Pago) ---
 
 app.post('/api/create-preference', async (req, res) => {
   const orderData = req.body;
@@ -543,7 +583,7 @@ app.post('/api/create-preference', async (req, res) => {
   const ordersCollection = db.collection('orders');
   const inventoryCollection = db.collection('products');
   const session = clientMongo.startSession();
-
+  
   let createdOrderId;
   let itemsForRollback = [];
 
@@ -656,83 +696,23 @@ app.post('/api/mercadopago-webhook', async (req, res) => {
             if (paymentStatusFromMP === 'approved') {
               newOrderStatusInDB = 'paid';
               paymentDetailsUpdate['paymentDetails.paidAt'] = new Date();
-              if (order.status !== 'paid' && order.userId) {
-                await usersCollection.updateOne(
-                  { _id: new ObjectId(order.userId) },
-                  { $inc: { spins: 1 } },
-                  { session: currentSession }
-                );
-              }
-            } else if (['rejected', 'cancelled', 'refunded', 'charged_back'].includes(paymentStatusFromMP)) {
-              newOrderStatusInDB = 'failed';
-              if (order.status === 'pending_payment') {
-                for (const item of order.items) {
-                  await inventoryCollection.updateOne(
-                    { productId: item.productId },
-                    { $inc: { stock: item.quantity } },
-                    { session: currentSession }
-                  );
-                }
-              }
-            } else if (paymentStatusFromMP === 'in_process' || paymentStatusFromMP === 'pending') {
-              newOrderStatusInDB = 'pending_payment';
-            }
-
-            if (newOrderStatusInDB) {
-              paymentDetailsUpdate.status = newOrderStatusInDB;
-              await ordersCollection.updateOne({ _id: orderObjectId }, { $set: paymentDetailsUpdate }, { session: currentSession });
-            }
-          }
-        });
-      } catch (err) {
-        console.error(err);
-      } finally {
-        await session.endSession();
-      }
-    }
-  }
-  res.sendStatus(200);
-});
-
-app.post('/api/mercadopago-webhook', async (req, res) => {
-  const { query, body } = req;
-  const topic = query.topic || query.type;
-
-  if (topic === 'payment' || body?.type === 'payment') {
-    const paymentId = body?.data?.id;
-    if (paymentId && db) {
-      const session = clientMongo.startSession();
-      try {
-        await session.withTransaction(async (currentSession) => {
-          const paymentInfoResult = await payment.get({ id: paymentId.toString() });
-          const paymentStatusFromMP = paymentInfoResult?.status;
-          const externalReference = paymentInfoResult?.external_reference;
-
-          const ordersCollection = db.collection('orders');
-          const inventoryCollection = db.collection('products');
-          const usersCollection = db.collection('users');
-
-          const orderObjectId = new ObjectId(externalReference);
-          const order = await ordersCollection.findOne({ _id: orderObjectId }, { session: currentSession });
-
-          if (order) {
-            let newOrderStatusInDB;
-            let paymentDetailsUpdate = {
-              'paymentDetails.mercadoPagoPaymentId': paymentId.toString(),
-              'paymentDetails.paymentStatus': paymentStatusFromMP,
-              updatedAt: new Date()
-            };
-
-            if (paymentStatusFromMP === 'approved') {
-              newOrderStatusInDB = 'paid';
-              paymentDetailsUpdate['paymentDetails.paidAt'] = new Date();
               
               if (order.status !== 'paid' && order.userId) {
-                const spinsEarned = Math.floor(order.totalAmount / 500);
-                if (spinsEarned > 0) {
+                const SPIN_THRESHOLD = 500;
+                const user = await usersCollection.findOne({ _id: new ObjectId(order.userId) }, { session: currentSession });
+                let currentProgress = user?.progressAmount || 0;
+                let totalPool = currentProgress + order.totalAmount;
+                
+                const newSpins = Math.floor(totalPool / SPIN_THRESHOLD);
+                const newProgress = totalPool % SPIN_THRESHOLD;
+
+                if (newSpins > 0 || newProgress !== currentProgress) {
                     await usersCollection.updateOne(
                       { _id: new ObjectId(order.userId) },
-                      { $inc: { spins: spinsEarned } },
+                      { 
+                          $inc: { spins: newSpins },
+                          $set: { progressAmount: newProgress }
+                      },
                       { session: currentSession }
                     );
                 }
